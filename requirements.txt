@@ -1,0 +1,14 @@
+pyqt5>=5.15.7
+pyqtgraph>=0.13.1
+pyopengl>=3.1.6
+paramiko>=3.0.0
+asyncssh>=2.13.0
+pyzmq>=25.0.0
+fastapi>=0.95.0
+uvicorn>=0.22.0
+opencv-python>=4.7.0.72
+numpy>=1.22.0
+psutil>=5.9.0
+pywin32>=306; sys_platform == 'win32'
+sqlite3-to-mysql>=1.4.9
+pytest>=7.0.0
