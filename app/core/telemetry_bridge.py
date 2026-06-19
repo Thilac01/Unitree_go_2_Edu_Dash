@@ -3,8 +3,8 @@ import json
 import logging
 import random
 import math
+import socket
 from PyQt5.QtCore import QThread, pyqtSignal
-import zmq
 import numpy as np
 
 logger = logging.getLogger("DASH.TelemetryBridge")
@@ -23,6 +23,30 @@ class TelemetryBridge(QThread):
         self.socket = None
         self.latest_data = self.get_empty_telemetry()
         self.sim_tick = 0
+        
+        # Occupancy Grid Simulation Setup
+        self.map_width = 120
+        self.map_height = 120
+        self.map_resolution = 0.1
+        self.map_origin_x = -6.0
+        self.map_origin_y = -6.0
+        self.sim_map = np.full((120, 120), -1, dtype=np.int8)
+        self.gt_map = np.zeros((120, 120), dtype=np.int8)
+        
+        # Build ground-truth map outer walls
+        self.gt_map[0, :] = 100
+        self.gt_map[-1, :] = 100
+        self.gt_map[:, 0] = 100
+        self.gt_map[:, -1] = 100
+        # Columns/Boxes inside the field
+        self.gt_map[35:40, 35:40] = 100
+        self.gt_map[80:85, 30:35] = 100
+        self.gt_map[50:55, 80:85] = 100
+        self.gt_map[90:95, 90:95] = 100
+        self.start_time = time.time()
+        
+    def reset_simulated_map(self):
+        self.sim_map.fill(-1)
 
     def set_connection(self, host: str, port: int = 5555, simulated: bool = False):
         self.host = host
@@ -83,15 +107,6 @@ class TelemetryBridge(QThread):
         self.running = True
         logger.info("Telemetry bridge thread started.")
         
-        # Initialize ZeroMQ context
-        if not self.simulated:
-            self.context = zmq.Context()
-            self.socket = self.context.socket(zmq.SUB)
-            self.socket.setsockopt(zmq.CONFLATE, 1) # Keep only latest packet
-            self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
-            self.socket.connect(f"tcp://{self.host}:{self.port}")
-            logger.info(f"Connected to ZMQ sub socket at tcp://{self.host}:{self.port}")
-
         while self.running:
             if self.simulated:
                 # Generate high-fidelity simulated robot data at 10Hz
@@ -102,32 +117,48 @@ class TelemetryBridge(QThread):
                 self.pointcloud_received.emit(pc)
                 time.sleep(0.1)
             else:
-                # Listen to ZMQ port
+                # Connect to remote TCP Server
+                logger.info(f"Connecting to telemetry server at tcp://{self.host}:{self.port}")
+                client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_sock.settimeout(3.0)
                 try:
-                    # Non-blocking poll for incoming data
-                    if self.socket.poll(timeout=100, flags=zmq.POLLIN):
-                        msg = self.socket.recv_string()
-                        data = json.loads(msg)
-                        self.latest_data = data
-                        self.telemetry_received.emit(data)
-                        
-                        # Check for point cloud array
-                        if "pc_data" in data:
-                            points = np.array(data["pc_data"], dtype=np.float32)
-                            self.pointcloud_received.emit(points)
-                    else:
-                        time.sleep(0.01)
+                    client_sock.connect((self.host, self.port))
+                    client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    logger.info("Connected to telemetry server successfully.")
+                    
+                    buffer = ""
+                    while self.running:
+                        try:
+                            chunk = client_sock.recv(65536).decode('utf-8', errors='ignore')
+                            if not chunk:
+                                logger.info("Disconnected from telemetry server (EOF).")
+                                break
+                            buffer += chunk
+                            while "\n" in buffer:
+                                line, buffer = buffer.split("\n", 1)
+                                if line.strip():
+                                    try:
+                                        data = json.loads(line)
+                                        self.latest_data = data
+                                        self.telemetry_received.emit(data)
+                                        
+                                        # Check for point cloud array
+                                        if "pc_data" in data:
+                                            points = np.array(data["pc_data"], dtype=np.float32)
+                                            self.pointcloud_received.emit(points)
+                                    except Exception:
+                                        pass
+                        except socket.timeout:
+                            continue
                 except Exception as e:
-                    logger.debug(f"Telemetry read error: {e}")
-                    time.sleep(0.1)
-
-        # Cleanup ZMQ
-        if self.socket:
-            self.socket.close()
-            self.socket = None
-        if self.context:
-            self.context.term()
-            self.context = None
+                    logger.debug(f"Telemetry server connection error: {e}")
+                    time.sleep(1.0)
+                finally:
+                    try:
+                        client_sock.close()
+                    except Exception:
+                        pass
+                        
         logger.info("Telemetry bridge thread stopped.")
 
     def generate_mock_telemetry(self) -> dict:
@@ -197,6 +228,36 @@ class TelemetryBridge(QThread):
         slam_states = ["Mapping", "Localizing"]
         slam_status = slam_states[(self.sim_tick // 200) % 2]
         
+        # Generate robot path trajectory
+        traj = [[0.05 * x, 0.02 * math.sin(x)] for x in range(min(self.sim_tick, 500))]
+        
+        # Update Occupancy Grid map based on simulated sweep
+        if len(traj) > 0:
+            rx_m, ry_m = traj[-1]
+            # Map physical meters to grid index
+            rx = int((rx_m - self.map_origin_x) / self.map_resolution)
+            ry = int((ry_m - self.map_origin_y) / self.map_resolution)
+            
+            # Reveal cells within a 15-cell sweep radius
+            r_limit = 15
+            for dx in range(-r_limit, r_limit + 1):
+                for dy in range(-r_limit, r_limit + 1):
+                    cx = rx + dx
+                    cy = ry + dy
+                    if 0 <= cx < self.map_width and 0 <= cy < self.map_height:
+                        if dx*dx + dy*dy <= r_limit*r_limit:
+                            self.sim_map[cx, cy] = self.gt_map[cx, cy]
+                            
+        # Map telemetry data
+        map_payload = {
+            "width": self.map_width,
+            "height": self.map_height,
+            "resolution": self.map_resolution,
+            "origin_x": self.map_origin_x,
+            "origin_y": self.map_origin_y,
+            "data": self.sim_map.flatten().tolist()
+        }
+        
         return {
             "timestamp": time.time(),
             "system": {
@@ -243,12 +304,13 @@ class TelemetryBridge(QThread):
             },
             "slam": {
                 "status": slam_status,
-                "trajectory": [[0.05 * x, 0.02 * math.sin(x)] for x in range(min(self.sim_tick, 500))],
+                "trajectory": traj,
                 "loop_closures": self.sim_tick // 300,
                 "point_count": self.sim_tick * 1500,
                 "confidence": 92.5 + 5.0 * math.sin(t*0.1),
                 "runtime": t
             },
+            "map": map_payload,
             "motors": motors,
             "topics": topics
         }

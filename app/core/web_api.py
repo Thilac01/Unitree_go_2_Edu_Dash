@@ -103,14 +103,32 @@ class APIServerManager:
         self.host = "0.0.0.0"
         self.is_running = False
 
+    def _find_free_port(self, start_port: int, host: str = "0.0.0.0", max_attempts: int = 10) -> int:
+        """Scans ports starting at start_port and returns the first available one."""
+        import socket as _socket
+        for port in range(start_port, start_port + max_attempts):
+            try:
+                with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                    s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                    s.bind((host, port))
+                    return port
+            except OSError:
+                logger.debug(f"Port {port} is in use, trying next...")
+        raise RuntimeError(f"No free port in range {start_port}-{start_port + max_attempts - 1}")
+
     def start(self, host: str = "0.0.0.0", port: int = 8000):
         if self.is_running:
             return
-            
+
+        try:
+            self.port = self._find_free_port(port, host)
+        except RuntimeError as e:
+            logger.error(f"Cannot start API server: {e}")
+            return
+
         self.host = host
-        self.port = port
         self.is_running = True
-        
+
         config = uvicorn.Config(
             app=app,
             host=self.host,
@@ -119,7 +137,7 @@ class APIServerManager:
             loop="asyncio"
         )
         self.server = uvicorn.Server(config)
-        
+
         def run_srv():
             try:
                 self.server.run()
@@ -130,7 +148,10 @@ class APIServerManager:
 
         self.thread = threading.Thread(target=run_srv, daemon=True)
         self.thread.start()
-        logger.info(f"FastAPI Server started on {host}:{port}")
+        if self.port != port:
+            logger.warning(f"Port {port} was busy -- FastAPI Server started on fallback port {self.port}")
+        else:
+            logger.info(f"FastAPI Server started on {host}:{self.port}")
 
     def stop(self):
         if not self.is_running or not self.server:

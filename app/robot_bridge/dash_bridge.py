@@ -11,21 +11,20 @@ import json
 import logging
 import socket
 import threading
-import zmq
 
 # Attempt to load ROS2 Client libraries. If missing (e.g. running offline or testing),
 # we fall back to mock publishers to keep the daemon runnable.
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Imu, PointCloud2
+    from sensor_msgs.msg import Imu, PointCloud2, BatteryState
     from nav_msgs.msg import Odometry
     # Go2 EDU Motor status definitions depend on custom Unitree messages or ROS2 topics
     # We load standard types here
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
-    class Node: pass # Mock definition
+    class Node: pass  # Mock definition
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("DASH.RobotBridge")
@@ -38,11 +37,13 @@ class RobotTelemetryBridge(Node if ROS_AVAILABLE else object):
         else:
             logger.warning("ROS2 python bindings not detected. Running daemon in Simulation-Broadcast mode.")
             
-        # Initialize ZeroMQ Publisher
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUB)
-        self.socket.bind("tcp://0.0.0.0:5555")
-        logger.info("ZeroMQ Publisher bound to port 5555.")
+        # Initialize TCP Server Socket
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind(("0.0.0.0", 5555))
+        self.server_socket.listen(5)
+        self.clients = []
+        logger.info("TCP Telemetry Server listening on port 5555.")
         
         # Telemetry Cache
         self.telemetry = {
@@ -108,7 +109,14 @@ class RobotTelemetryBridge(Node if ROS_AVAILABLE else object):
             self.cloud_callback,
             2
         )
-        logger.info("ROS2 Subscribers initialized successfully.")
+        # 4. Battery State — standard ROS2 topic for Go2 EDU power system
+        self.sub_battery = self.create_subscription(
+            BatteryState,
+            '/battery_state',
+            self.battery_state_callback,
+            10
+        )
+        logger.info("ROS2 Subscribers initialized successfully (IMU, Odom, Cloud, Battery).")
 
     # --- Callback triggers updating caches ---
     def imu_callback(self, msg: Imu):
@@ -133,11 +141,37 @@ class RobotTelemetryBridge(Node if ROS_AVAILABLE else object):
                 traj.pop(0)
 
     def cloud_callback(self, msg: PointCloud2):
+        import struct
+        try:
+            # Extract x,y,z float values, downsampling by 15x to keep JSON payloads light and fast
+            pts = []
+            step = 15
+            data = msg.data
+            point_step = msg.point_step
+            num_points = msg.width * msg.height
+            
+            for i in range(0, len(data), point_step * step):
+                if i + 12 <= len(data):
+                    x, y, z = struct.unpack_from('fff', data, i)
+                    pts.append([float(x), float(y), float(z)])
+                    
+            with self.lock:
+                self.telemetry["pc_data"] = pts
+                self.telemetry["lidar"]["point_count"] = num_points
+        except Exception as e:
+            logger.error(f"Error parsing point cloud in RobotBridge: {e}")
+
+    def battery_state_callback(self, msg: 'BatteryState'):
+        """Reads ROS2 /battery_state topic (sensor_msgs/msg/BatteryState)."""
         with self.lock:
-            # We can extract metadata
-            self.telemetry["lidar"]["point_count"] = msg.width * msg.height
-            # In a full ROS implementation, we serialize binary point cloud data
-            # and publish it under a separate high-frequency binary stream or ZMQ channel.
+            percentage = int(msg.percentage * 100) if msg.percentage <= 1.0 else int(msg.percentage)
+            self.telemetry["battery"]["voltage"]        = round(float(msg.voltage), 2)
+            self.telemetry["battery"]["current"]        = round(float(msg.current), 2)
+            self.telemetry["battery"]["percentage"]     = max(0, min(100, percentage))
+            self.telemetry["battery"]["temperature"]    = round(float(msg.temperature), 1)
+            self.telemetry["battery"]["remaining_time"] = round(
+                float(msg.capacity) / max(abs(float(msg.current)), 0.001) * 60.0, 1
+            ) if msg.current != 0.0 else self.telemetry["battery"]["remaining_time"]
 
     def query_system_stats(self):
         """Interrogates standard sysfs directories on SBC to read CPU & memory loads."""
@@ -161,11 +195,13 @@ class RobotTelemetryBridge(Node if ROS_AVAILABLE else object):
                 self.telemetry["system"]["cpu"] = round(cpu_pct, 1)
                 self.telemetry["system"]["ram"] = round(ram_pct, 1)
                 self.telemetry["system"]["temperature"] = round(temp, 1)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"System stats read failed (non-Linux or permission issue): {e}")
             # Fallback to simulated fluctuations
             with self.lock:
-                self.telemetry["system"]["cpu"] = round(15.0 + 5.0 * time.time() % 3, 1)
-                self.telemetry["system"]["ram"] = 42.0
+                t_mod = time.time() % 60.0
+                self.telemetry["system"]["cpu"] = round(15.0 + 5.0 * math.sin(t_mod), 1)
+                self.telemetry["system"]["ram"] = round(40.0 + 5.0 * math.sin(t_mod * 0.3), 1)
 
     def start(self):
         self.running = True
@@ -179,23 +215,58 @@ class RobotTelemetryBridge(Node if ROS_AVAILABLE else object):
         t_sys = threading.Thread(target=sys_poll_loop, daemon=True)
         t_sys.start()
         
+        # Start TCP Client Connection Acceptor thread
+        def accept_loop():
+            while self.running:
+                try:
+                    client_sock, addr = self.server_socket.accept()
+                    client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    with self.lock:
+                        self.clients.append(client_sock)
+                    logger.info(f"Telemetry client connected from {addr}")
+                except Exception:
+                    break
+        t_accept = threading.Thread(target=accept_loop, daemon=True)
+        t_accept.start()
+        
         # Main publication loop at 10Hz
         while self.running:
             with self.lock:
                 self.telemetry["timestamp"] = time.time()
-                payload = json.dumps(self.telemetry)
-                
-            try:
-                self.socket.send_string(payload)
-            except Exception as e:
-                logger.error(f"ZMQ send failed: {e}")
-                
+                payload = json.dumps(self.telemetry) + "\n"
+            
+            payload_bytes = payload.encode('utf-8')
+            
+            with self.lock:
+                active_clients = list(self.clients)
+            
+            for client in active_clients:
+                try:
+                    client.sendall(payload_bytes)
+                except Exception:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    with self.lock:
+                        if client in self.clients:
+                            self.clients.remove(client)
+                            
             time.sleep(0.1)
 
     def stop(self):
         self.running = False
-        self.socket.close()
-        self.context.term()
+        try:
+            self.server_socket.close()
+        except Exception:
+            pass
+        with self.lock:
+            for client in self.clients:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            self.clients.clear()
         logger.info("Aggregator loop terminated.")
 
 def main(args=None):
