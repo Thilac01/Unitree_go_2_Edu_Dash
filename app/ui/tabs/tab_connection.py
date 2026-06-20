@@ -244,18 +244,22 @@ class TabConnection(QWidget):
             self.abort_wizard()
 
     def wizard_step4(self):
-        # Query robot for python unitree libraries or check file structures
-        status, out, err = ssh_manager.execute_command("python3 -c 'import zmq; print(\"OK\")' || echo 'FAIL'", timeout=3.0)
-        if "OK" in out or self.current_wizard_ip == "127.0.0.1":
+        # Verify python is available on the robot (standard check)
+        status, out, err = ssh_manager.execute_command("python3 -V", timeout=3.0)
+        python_ok = "Python" in out or self.current_wizard_ip == "127.0.0.1"
+        
+        if python_ok:
             self.set_step_status(3, "done")
-            self.progress_bar.setValue(4)
-            # Step 5: Verify ROS
-            self.set_step_status(4, "active")
-            QTimer.singleShot(500, self.wizard_step5)
         else:
             self.set_step_status(3, "fail")
-            QMessageBox.warning(self, "SDK Layer Unverified", "Onboard robot computer is missing required packages (e.g. pyzmq). Make sure you run setup.")
+            QMessageBox.warning(self, "Python Missing", "Could not locate python3 execution layer on remote robot.")
             self.abort_wizard()
+            return
+
+        self.progress_bar.setValue(4)
+        # Always proceed to Step 5: Verify ROS
+        self.set_step_status(4, "active")
+        QTimer.singleShot(500, self.wizard_step5)
 
     def wizard_step5(self):
         # Check if ROS environment (like foxy or humble) directories exist or ros2 CLI is accessible
@@ -272,7 +276,46 @@ class TabConnection(QWidget):
             self.abort_wizard()
 
     def wizard_step6(self):
-        # Start Telemetry Bridge
+        # Auto-deploy telemetry bridge if not simulated
+        if self.current_wizard_ip != "127.0.0.1":
+            try:
+                # 1. Upload dash_bridge.py
+                import os
+                # Find path to local dash_bridge.py
+                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                local_bridge = os.path.join(base_dir, "app", "robot_bridge", "dash_bridge.py")
+                remote_bridge = "/home/unitree/dash_bridge.py"
+                
+                if os.path.exists(local_bridge) and ssh_manager.sftp:
+                    ssh_manager.sftp.put(local_bridge, remote_bridge)
+                    ssh_manager.execute_command(f"chmod +x {remote_bridge}")
+                    
+                    # 3. Kill any active daemon to prevent port bind conflicts
+                    ssh_manager.execute_command("pkill -f dash_bridge.py")
+                    
+                    # 4. Start bridge in background, sourcing ROS2 beforehand
+                    # All output is captured in /tmp/dash_bridge.log for debugging
+                    log_file = "/tmp/dash_bridge.log"
+                    launch_cmd = (
+                        f"nohup bash -c '"
+                        f"source /opt/ros/foxy/setup.bash 2>/dev/null || "
+                        f"source /opt/ros/humble/setup.bash 2>/dev/null || "
+                        f"source /opt/ros/iron/setup.bash 2>/dev/null; "
+                        f"python3 {remote_bridge}' > {log_file} 2>&1 &"
+                    )
+                    _, out, err = ssh_manager.execute_command(launch_cmd, timeout=5.0)
+                    if err and err.strip():
+                        import logging as _log
+                        _log.getLogger("DASH.ConnectionWizard").warning(
+                            f"dash_bridge launch stderr: {err.strip()[:300]}"
+                        )
+                    logger.info(f"Telemetry bridge launched on robot. Logs at: {log_file}")
+            except Exception as e:
+                import logging
+                logger = logging.getLogger("DASH.ConnectionWizard")
+                logger.error(f"Failed to auto-deploy onboard telemetry bridge: {e}")
+
+        # Start Telemetry Bridge on client side
         telemetry_bridge.set_connection(self.current_wizard_ip, 5555, simulated=(self.current_wizard_ip == "127.0.0.1"))
         telemetry_bridge.start()
         

@@ -198,8 +198,8 @@ class MainWindow(QMainWindow):
         self.workspace.addWidget(self.tab_api)         # 13
         self.workspace.addWidget(self.tab_settings)    # 14
         
-        # Default display Dashboard
-        self.sidebar.setCurrentRow(0)
+        # Default display SLAM Mapping Console on launch
+        self.sidebar.setCurrentRow(3)
 
     def setup_statusbar(self):
         self.lbl_ip = QLabel("ROBOT IP: Disconnected  |")
