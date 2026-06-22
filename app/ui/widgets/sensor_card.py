@@ -1,6 +1,7 @@
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
+from typing import Any
 
 class SensorCard(QWidget):
     def __init__(self, title: str, unit: str = "", parent=None):

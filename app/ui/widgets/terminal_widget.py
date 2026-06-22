@@ -1,8 +1,9 @@
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QListWidget, QSplitter
 from PyQt5.QtGui import QFont, QKeyEvent
-from PyQt5.QtCore import Qt, pyqtSlot
+from PyQt5.QtCore import Qt, pyqtSlot, QEvent
 from app.core.ssh_client import ssh_manager
 from app.core.database import db
+
 
 class TerminalWidget(QWidget):
     def __init__(self, parent=None):
@@ -62,6 +63,12 @@ class TerminalWidget(QWidget):
         self.btn_send = QPushButton("Send")
         self.btn_send.clicked.connect(self.send_command)
         self.input_layout.addWidget(self.btn_send)
+        
+        self.btn_kill = QPushButton("Kill (Ctrl+C)")
+        self.btn_kill.setStyleSheet("background-color: #e63946; color: white; font-weight: bold;")
+        self.btn_kill.clicked.connect(self.send_sigint)
+        self.input_layout.addWidget(self.btn_kill)
+        
         self.right_layout.addLayout(self.input_layout)
         
         self.splitter.addWidget(self.right_panel)
@@ -71,6 +78,10 @@ class TerminalWidget(QWidget):
         
         # Connect to SSH signals
         ssh_manager.shell_data_received.connect(self.append_output)
+        
+        # Install event filters to handle keystrokes directly on child widgets
+        self.cmd_input.installEventFilter(self)
+        self.console.installEventFilter(self)
         
         self.refresh_shortcuts()
 
@@ -127,23 +138,30 @@ class TerminalWidget(QWidget):
         ssh_manager.write_to_shell(cmd + "\n")
         self.cmd_input.clear()
 
-    # Capture direct keystrokes if focused to allow interactiveness (e.g. CTRL+C)
-    def keyPressEvent(self, event: QKeyEvent):
-        if self.cmd_input.hasFocus():
-            # Let standard line-edit handle it
-            super().keyPressEvent(event)
-            return
-            
-        # Send raw control keys (e.g., CTRL+C) directly to remote shell
-        if event.modifiers() & Qt.ControlModifier:
-            key = event.key()
-            if key == Qt.Key_C:
-                ssh_manager.write_to_shell("\x03") # SIGINT
-                event.accept()
-                return
-            elif key == Qt.Key_Z:
-                ssh_manager.write_to_shell("\x1a") # SIGTSTP
-                event.accept()
-                return
-                
-        super().keyPressEvent(event)
+    def send_sigint(self):
+        """Sends raw SIGINT signal (Ctrl+C) to active remote SSH shell."""
+        if ssh_manager.is_connected():
+            ssh_manager.write_to_shell("\x03")
+
+    def eventFilter(self, watched, event):
+        """Intercepts keyboard shortcut events on inputs to forward SIGINT/SIGTSTP/EOF."""
+        if event.type() == QEvent.KeyPress:
+            if event.modifiers() & Qt.ControlModifier:
+                key = event.key()
+                if key == Qt.Key_C:
+                    self.send_sigint()
+                    if watched == self.cmd_input:
+                        self.cmd_input.clear()
+                    event.accept()
+                    return True
+                elif key == Qt.Key_Z:
+                    if ssh_manager.is_connected():
+                        ssh_manager.write_to_shell("\x1a") # SIGTSTP
+                    event.accept()
+                    return True
+                elif key == Qt.Key_D:
+                    if ssh_manager.is_connected():
+                        ssh_manager.write_to_shell("\x04") # EOF
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)

@@ -12,3 +12,4 @@ psutil>=5.9.0
 pywin32>=306; sys_platform == 'win32'
 sqlite3-to-mysql>=1.4.9
 pytest>=7.0.0
+requests
